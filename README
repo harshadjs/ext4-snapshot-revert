@@ -1,0 +1,5 @@
+This is Google Summer of Code 2011 repository.
+
+Abstract:
+
+In today's world, large number of packages are downloaded and installed. Considering this scenario there is a need to have a feature that would rollback the system to a state before the package was installed. The snapshots feature in a file system can be effectively used for the same. Yum currently has support for doing snapshots in btrfs before starting a transaction. It would be a good idea to add support for Ext4 snapshots in yum.
