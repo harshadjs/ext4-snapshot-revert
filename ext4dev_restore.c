@@ -19,30 +19,42 @@
 
 struct snapshot_list {
 	char name[MAX_FILE_NAME];
-	unsigned long time;
+	int id;
 	struct snapshot_list *next;
 } *list_head;
 
 int add_to_snapshot_list(const char *fpath, const struct stat *sb, int type)
 {	
 	struct snapshot_list *list_node;
+	int fd,id;
 
 	if(type != FTW_F)
 		return 0; 
 	
-	printf("\n%s %ld", fpath, sb->st_ctime);
+	fd = open(fpath, O_RDONLY);
+	if(fd < 0) {
+		printf("\nError opening snapshot %s",fpath);
+		return -1;
+	}
+	if(ioctl(fd, FS_IOC_GETVERSION, &id) < 0) {
+		printf("\nError while reading snapshot id of snapshot %s", fpath);
+		return -1;	
+	}
+	printf("\n%s %d", fpath, id);
+	close(fd);
+
 	if(list_head == NULL) {
 		list_node = (struct snapshot_list *)malloc(sizeof(struct snapshot_list));
 		strcpy(list_node->name, fpath);
-		list_node->time = sb->st_ctime;
+		list_node->id = id;
 		list_node->next = NULL;
 		list_head = list_node;
 	}
 	else if (list_head->next == NULL) {
-		if(list_head->time < sb->st_ctime) {
+		if(list_head->id < id) {
 			list_node = (struct snapshot_list *)malloc(sizeof(struct snapshot_list));
 			strcpy(list_node->name, fpath);
-			list_node->time = sb->st_ctime;
+			list_node->id = id;
 			list_node->next = NULL;
 
 			list_head->next = list_node;
@@ -50,28 +62,28 @@ int add_to_snapshot_list(const char *fpath, const struct stat *sb, int type)
 		else {
 			list_node = (struct snapshot_list *)malloc(sizeof(struct snapshot_list));
 			strcpy(list_node->name, fpath);
-			list_node->time = sb->st_ctime;
+			list_node->id = id;
 
 			list_node->next = list_head;
 			list_head = list_node;
 		}
 	}
 	else {
-		if(sb->st_ctime < list_head->time) {
+		if(id < list_head->id) {
 			list_node = (struct snapshot_list *)malloc(sizeof(struct snapshot_list));
 			strcpy(list_node->name, fpath);
-			list_node->time = sb->st_ctime;
+			list_node->id = id;
 			list_node->next = list_head;
 			list_head = list_node;			
 		}
 		else {
 			struct snapshot_list *temp;
 			list_node = list_head;
-			while(list_node->next && (list_node->next->time < sb->st_ctime))
+			while(list_node->next && (list_node->next->id < id))
 				list_node = list_node->next;
 			temp = (struct snapshot_list *)malloc(sizeof(struct snapshot_list));
 			strcpy(temp->name, fpath);
-			temp->time = sb->st_ctime;
+			temp->id = id;
 			temp->next = list_node->next;
 			list_node->next = temp;
 		}
@@ -224,6 +236,7 @@ int main(int argc, char **argv)
 	}
 
 	printf("\nFTW completed");
+	read_list();
 	disk_image = open("/tmp/disk_image.img", O_CREAT | O_WRONLY, 0777);
 
 	if(list_head == NULL) {
@@ -256,7 +269,7 @@ int main(int argc, char **argv)
 	} while(strcmp(command, snapshot_file));
 	
 	close(disk_image);
-			
+				
 	strcpy(command, "umount ");
 	strcat(command, mount_point);
 	system(command);
