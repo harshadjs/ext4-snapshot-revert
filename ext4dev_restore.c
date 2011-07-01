@@ -12,6 +12,7 @@
 #include <linux/fiemap.h>
 
 #include <ftw.h>
+#include "e2p/e2p.h"
 
 #define SNAPSHOT_SHIFT 4096*1036
 #define MAX 50
@@ -26,23 +27,17 @@ struct snapshot_list {
 int add_to_snapshot_list(const char *fpath, const struct stat *sb, int type)
 {	
 	struct snapshot_list *list_node;
-	int fd,id;
+	unsigned long id;
 
 	if(type != FTW_F)
 		return 0; 
 	
-	fd = open(fpath, O_RDONLY);
-	if(fd < 0) {
-		printf("\nError opening snapshot %s",fpath);
+	if(fgetversion(fpath, &id) < 0) {
+		printf("\nFailed to get snapshot id");
 		return -1;
 	}
-	if(ioctl(fd, FS_IOC_GETVERSION, &id) < 0) {
-		printf("\nError while reading snapshot id of snapshot %s", fpath);
-		return -1;	
-	}
-	printf("\n%s %d", fpath, id);
-	close(fd);
-
+	printf("\n%s %ld", fpath, id);
+	
 	if(list_head == NULL) {
 		list_node = (struct snapshot_list *)malloc(sizeof(struct snapshot_list));
 		strcpy(list_node->name, fpath);
