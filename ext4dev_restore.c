@@ -46,7 +46,7 @@ int add_to_snapshot_list(const char *fpath, const struct stat *sb, int type)
 		list_head = list_node;
 	}
 	else if (list_head->next == NULL) {
-		if(list_head->id < id) {
+		if(list_head->id > id) {
 			list_node = (struct snapshot_list *)malloc(sizeof(struct snapshot_list));
 			strcpy(list_node->name, fpath);
 			list_node->id = id;
@@ -64,7 +64,7 @@ int add_to_snapshot_list(const char *fpath, const struct stat *sb, int type)
 		}
 	}
 	else {
-		if(id < list_head->id) {
+		if(id > list_head->id) {
 			list_node = (struct snapshot_list *)malloc(sizeof(struct snapshot_list));
 			strcpy(list_node->name, fpath);
 			list_node->id = id;
@@ -74,7 +74,7 @@ int add_to_snapshot_list(const char *fpath, const struct stat *sb, int type)
 		else {
 			struct snapshot_list *temp;
 			list_node = list_head;
-			while(list_node->next && (list_node->next->id < id))
+			while(list_node->next && (list_node->next->id > id))
 				list_node = list_node->next;
 			temp = (struct snapshot_list *)malloc(sizeof(struct snapshot_list));
 			strcpy(temp->name, fpath);
