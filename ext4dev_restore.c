@@ -232,7 +232,7 @@ int main(int argc, char **argv)
 
 	printf("\nFTW completed");
 	read_list();
-	disk_image = open("/tmp/disk_image.img", O_CREAT | O_WRONLY, 0777);
+	disk_image = creat("/tmp/disk_image.img", 0777);
 
 	if(list_head == NULL) {
 		printf("\nNo snapshot taken");
