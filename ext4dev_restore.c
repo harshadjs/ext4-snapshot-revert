@@ -17,12 +17,15 @@
 #define SNAPSHOT_SHIFT 4096*1036
 #define MAX 50
 #define MAX_FILE_NAME 1024
+#define MNT "/mnt/temp"
 
 struct snapshot_list {
 	char name[MAX_FILE_NAME];
 	int id;
 	struct snapshot_list *next;
 } *list_head;
+
+char snapshot_dir[MAX], mount_point[MAX];
 
 int add_to_snapshot_list(const char *fpath, const struct stat *sb, int type)
 {	
@@ -191,17 +194,43 @@ void restore_fs(char *device_path)
 	close(device);
 }
 
-void umount_and_exit(char *device, int status)
+int umount_snapshot(const char *fpath, const struct stat *sb, int type)
 {
-	umount(device);
-	rmdir("/mnt/temp");
-	exit(status);
+	char *snapshot_name;
+	char snapshot_mnt[MAX];
+	struct stat st_mnt;
+
+	snapshot_name = (char *)(fpath + strlen(snapshot_dir) + 1);
+	sprintf(snapshot_mnt, "%s@%s", mount_point, snapshot_name);
+	if(stat(snapshot_mnt, &st_mnt) == 0) {
+		umount(snapshot_mnt);
+		rmdir(snapshot_mnt);
+	}
+	printf("\numount : %s", snapshot_mnt);
+	return 0;
+}
+
+
+int umount_device(char *device)
+{
+	int error;
+
+	if((error = ftw(snapshot_dir, umount_snapshot, 10)) != 0) {
+		printf("\nCannot walk throught fs");
+		return error;
+	}
+
+	error = umount(device);
+	if(error)
+		return error;
+	rmdir(MNT);
+	return error;
 }
 
 int main(int argc, char **argv)
 {
-        int fd, disk_image;
-	char command[MAX], mount_point[MAX], snapshot_dir[MAX], snapshot_file[MAX];
+        int fd, error, disk_image;
+	char command[MAX], snapshot_file[MAX];
 	char *snapshot_name;
 	struct snapshot_list *node;
 	struct fiemap *fiemap;
@@ -213,13 +242,19 @@ int main(int argc, char **argv)
                 exit(EXIT_FAILURE);
         }
 
-	if(mkdir("/mnt/temp",S_IRWXU | S_IRWXG | S_IROTH | S_IXOTH) != 0) {
+	if(mkdir(MNT,S_IRWXU | S_IRWXG | S_IROTH | S_IXOTH) != 0) {
 		printf("\nFailed to create mount point");
 		exit(EXIT_FAILURE);
 	}
-	strcpy(mount_point, "/mnt/temp");
+	strcpy(mount_point, MNT);
 
-	sprintf(command,"snapshot.ext4dev mount %s %s",argv[1],mount_point);
+	if(mount(argv[1], mount_point, "ext4dev", 0, NULL)) {
+		printf("\nError while mounting");
+		exit(EXIT_FAILURE);
+	}
+
+#warning "Remove snapshot.ext4dev config command"
+	sprintf(command, "snapshot.ext4dev config %s %s",argv[1],mount_point);
 	system(command);
 
 	sprintf(snapshot_dir, "%s/.snapshots", mount_point);
@@ -227,7 +262,8 @@ int main(int argc, char **argv)
 
 	if(ftw(snapshot_dir, add_to_snapshot_list, 10) != 0) {
 		printf("\nCannot walk throught fs");
-		umount_and_exit(argv[1], EXIT_FAILURE);
+		umount_device(argv[1]);
+		exit(EXIT_FAILURE);
 	}
 
 	printf("\nFTW completed");
@@ -236,26 +272,32 @@ int main(int argc, char **argv)
 
 	if(list_head == NULL) {
 		printf("\nNo snapshot taken");
-		umount_and_exit(argv[1], EXIT_FAILURE);
+		umount_device(argv[1]);
+		exit(EXIT_FAILURE);
 	}
 
 	node = list_head;
 
 	do {
 		snapshot_name = node->name + strlen(snapshot_dir) + 1;
+
+#warning "Implement snapshot enable using ioctls"
+
 		sprintf(command, "snapshot.ext4dev enable %s", snapshot_name);
 		printf("\n%s\n",command);
 		system(command);
 		
 		if ((fd = open(node->name, O_RDONLY)) < 0) {
 			fprintf(stderr, "Cannot open file %s\n", node->name);
-			umount_and_exit(argv[1], EXIT_FAILURE);
+			umount_device(argv[1]);
+			exit(EXIT_FAILURE);
 		}
 		else if ((fiemap = read_fiemap(fd)) != NULL) 
 			dump_fiemap(fiemap, fd, disk_image);
 		else {
 			printf("\nfiemap ioctl failed");
-			umount_and_exit(argv[1], EXIT_FAILURE);
+			umount_device(argv[1]);
+			exit(EXIT_FAILURE);
 		}
 		close(fd);
 		node = node->next;
@@ -265,15 +307,14 @@ int main(int argc, char **argv)
 	
 	close(disk_image);
 				
-	strcpy(command, "umount ");
-	strcat(command, mount_point);
-	system(command);
-
+	if(umount_device(mount_point)) {
+		printf("\nError while umounting");
+		exit(EXIT_FAILURE);
+	}       
 	restore_fs(argv[1]);
 
 	sprintf(command, "fsck.ext4dev -fxy %s", argv[1]);
 	system(command);
 
-	rmdir("/mnt/temp");
         exit(EXIT_SUCCESS);
 }
