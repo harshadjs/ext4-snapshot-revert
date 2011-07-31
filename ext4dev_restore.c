@@ -223,9 +223,9 @@ void dump_fiemap(struct fiemap *fiemap, int snapshot_file, int disk_image, int s
 				 * Allocate area for 1 metadata chunk + data chunks addressable from that chunk
 				 */
 				p = (struct lvm_export *)malloc(sizeof(struct lvm_export *));
-				p->area = malloc((SECTOR_SIZE<<4) * (SECTOR_SIZE+1));
+				p->area = malloc((SECTOR_SIZE>>2) * (SECTOR_SIZE+1));
 				p->next = NULL;
-				memset(p->area, -1, (SECTOR_SIZE<<4) * (SECTOR_SIZE+1));
+				memset(p->area, -1, (SECTOR_SIZE>>2) * (SECTOR_SIZE+1));
 				lvm_export = p;
 			}
 			else if(full && should_lvm_export) {
@@ -235,9 +235,9 @@ void dump_fiemap(struct fiemap *fiemap, int snapshot_file, int disk_image, int s
 				 */
 				p->next = (struct lvm_export *)malloc(sizeof(struct lvm_export *));
 				p = p->next;
-				p->area = malloc((SECTOR_SIZE<<4) * (SECTOR_SIZE+1));
+				p->area = malloc((SECTOR_SIZE>>2 * (SECTOR_SIZE+1));
 				p->next = NULL;
-				memset(p->area, -1, (SECTOR_SIZE<<4) * (SECTOR_SIZE+1));
+				memset(p->area, -1, (SECTOR_SIZE>>2) * (SECTOR_SIZE+1));
 				full = 0;
 			}
 	
