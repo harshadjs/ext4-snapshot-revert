@@ -254,7 +254,7 @@ int create_lvmexport(void)
 	//	lvm_image = open(LVM_IMAGE_PATH, O_WRONLY|O_CREAT);
 
 	while(p) {
-		if ((fd = open(target_snapshot->name, O_RDONLY)) < 0) {
+		if ((fd = open(p->name, O_RDONLY)) < 0) {
 			fprintf(stderr, "Cannot open file %s\n", p->name);
 			return 0;
 		}	
