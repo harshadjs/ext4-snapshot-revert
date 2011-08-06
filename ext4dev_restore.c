@@ -45,7 +45,7 @@ struct disk_exception {
     uint64_t new_chunk;
 };
 
-char snapshot_dir[MAX], mount_point[MAX];
+char command[MAX], snapshot_file[MAX], snapshot_dir[MAX], mount_point[MAX];
 
 /*
  * This function called from ftw adds snapshots one by one into the snapshot list.
@@ -127,6 +127,9 @@ int add_to_snapshot_list(const char *fpath, const struct stat *sb, int type)
 	return 0;
 }
 
+/*
+ *
+ */
 int set_target_snapshot(char *snapshot_file)
 {
 	struct snapshot_list *t = list_head;
@@ -216,7 +219,6 @@ struct fiemap *read_fiemap(int fd)
 
         extents_size = sizeof(struct fiemap_extent) * 
                               (fiemap->fm_mapped_extents);
-
 
         if ((fiemap = (struct fiemap*)realloc(fiemap,sizeof(struct fiemap) + 
                                          extents_size)) == NULL) {
@@ -325,6 +327,7 @@ int create_lvmexport(void)
 	for(i=0; exception_mdata[i] != -1 ;i+=2) {
 		printf("\n%ld\t%ld\n", exception_mdata[i], exception_mdata[i+1]);
 	}
+	umount_device(mount_point);
 	return 0;
 }
 	
@@ -334,16 +337,13 @@ int create_lvmexport(void)
  * if set builds lvm export list
  * if reset builds temporary disk image
  */
-void dump_fiemap(struct fiemap *fiemap, int snapshot_file, int disk_image, int should_lvm_export)
+void dump_fiemap(struct fiemap *fiemap, int snapshot_file, int disk_image)
 {
 	int i,j,k;
 	void *buf;
 	static int full=0;
 	static unsigned long offset=0;
 	static struct lvm_export *p=NULL;	
-
-	if(!p && should_lvm_export)
-		p = lvm_export;
 
 	for (i=0;i<fiemap->fm_mapped_extents;i++) {
 		if(fiemap->fm_extents[i].fe_logical - SNAPSHOT_SHIFT !=
@@ -353,88 +353,8 @@ void dump_fiemap(struct fiemap *fiemap, int snapshot_file, int disk_image, int s
 			lseek(snapshot_file, fiemap->fm_extents[i].fe_logical - SNAPSHOT_SHIFT, SEEK_SET);
 			read(snapshot_file, buf, fiemap->fm_extents[i].fe_length);			
 
-			if(!p && should_lvm_export) {
-				/*
-				 * Allocating for the first time
-				 * Allocate area for 1 metadata chunk + data chunks addressable from that chunk
-				 */
-				p = (struct lvm_export *)malloc(sizeof(struct lvm_export *));
-				p->area = malloc(((SECTOR_SIZE>>4)+1) * SECTOR_SIZE);
-				printf("\nAllocating %d bytes\n", (((SECTOR_SIZE>>4)+1) * SECTOR_SIZE));
-				p->next = NULL;
-				memset(p->area, -1,  ((SECTOR_SIZE>>4)+1) * SECTOR_SIZE);
-				lvm_export = p;
-			}
-			else if(full && should_lvm_export) {
-				/*
-				 * Chunks full
-				 * Need to allocate another metdata chunk + data chunks
-				 */
-				p->next = (struct lvm_export *)malloc(sizeof(struct lvm_export *));
-				p = p->next;
-				p->area = malloc(((SECTOR_SIZE>>4)+1) * SECTOR_SIZE);
-				p->next = NULL;
-				memset(p->area, -1, ((SECTOR_SIZE>>4)+1) * SECTOR_SIZE);
-				full = 0;
-			}
-	
-			if(should_lvm_export) {
-				/*
-				 * Building LVM export list
-				 */
-				int location = 0;
-				struct disk_exception de;
-
-				for(j=0,k=0; j < (fiemap->fm_extents[i].fe_length) / SECTOR_SIZE; j++,k+=2) {
-					location = search_in_area(p->area, offset+j,
-								  (fiemap->fm_extents[i].fe_logical 
-								   - SNAPSHOT_SHIFT)/SECTOR_SIZE + k);
-
-					if(location < 0) {
-						/*
-						 * The is not present in export list
-						 * Writing metadata to metadata chunk
-						 */
-
-						de.old_chunk 
-							= fiemap->fm_extents[i].fe_logical/SECTOR_SIZE
-							+ j - SNAPSHOT_SHIFT/SECTOR_SIZE;
-						de.new_chunk = 0;
-						p->area[2*offset+k] = de.old_chunk;
-						p->area[2*offset+k+1] = de.new_chunk;
-
-						/*
-						 * Writing data to data chunks
-						 */
-						printf("\nCopying %ld bytes at %ld\n", (long)fiemap->fm_extents[i].fe_length, (long)((offset+j+1)*SECTOR_SIZE));
-						memcpy(p->area + (offset+j+1)*SECTOR_SIZE, buf,
-						       SECTOR_SIZE);
-					}
-					else{}
-						/*
-						 * Block already present
-						 * Just overwrite the corresponding data chunk
-						 */
-					/*	memcpy(p->area + (location + 2)*SECTOR_SIZE, buf,
-						fiemap->fm_extents[i].fe_length);*/
-				}
-				offset = (offset + (fiemap->fm_extents[i].fe_length/SECTOR_SIZE))
-					% SECTOR_SIZE;
-				/*
-				 * offset might exceed sectorsize
-				 * in that case chunks are full
-				 * set flag full
-				 */
-				if(!offset)
-					full = 1;
-			}
-			else {
-				/*
-				 * Reverting to earlier snapshot
-				 */
-				lseek(disk_image, fiemap->fm_extents[i].fe_logical - SNAPSHOT_SHIFT, SEEK_SET);
-				write(disk_image, buf, fiemap->fm_extents[i].fe_length);
-			}
+			lseek(disk_image, fiemap->fm_extents[i].fe_logical - SNAPSHOT_SHIFT, SEEK_SET);
+			write(disk_image, buf, fiemap->fm_extents[i].fe_length);
 			free(buf);
 		}
 	}
@@ -474,10 +394,61 @@ int search_in_area(uint64_t *area, int end, uint64_t key)
  */
 void restore_fs(char *device_path)
 {
-	int i;
-	int device=open(device_path, O_RDWR, 0660), disk_image=open("/tmp/disk_image.img", O_RDONLY);
+	int i, fd, error;
+	int device, disk_image;
 	void *buf;
+	struct snapshot_list *node;
 	struct fiemap *fiemap;
+	char *snapshot_name;
+
+	disk_image = creat("/tmp/disk_image.img", 0777);
+	
+	if(list_head == NULL) {
+		printf("\nNo snapshot taken");
+		umount_device(device_path);
+		exit(EXIT_FAILURE);
+	}
+
+	node = list_head;
+		
+	/*
+	 * Iterate over the list, capture all changed blocks from snapshots
+	 * dump them to temporary disk image
+	 */
+		
+	do {
+		snapshot_name = node->name + strlen(snapshot_dir) + 1;
+
+#warning "Implement snapshot enable using ioctls"
+
+		if ((fd = open(node->name, O_RDONLY)) < 0) {
+			fprintf(stderr, "Cannot open file %s\n", node->name);
+			umount_device(device_path);
+			exit(EXIT_FAILURE);
+		}
+		else {
+			sprintf(command, "snapshot.ext4dev enable %s", snapshot_name);
+			printf("\n%s\n",command);
+			system(command);
+		}
+			
+		if ((fiemap = read_fiemap(fd)) != NULL)
+			dump_fiemap(fiemap, fd, disk_image);
+		else {
+			printf("\nfiemap ioctl failed");
+			umount_device(device_path);
+			exit(EXIT_FAILURE);
+		}
+		close(fd);
+		node = node->next;
+		sprintf(command,"%s/%s",snapshot_dir,snapshot_name);
+		printf("com : %s \t file : %s\n",command,snapshot_file);
+	} while(strcmp(command, snapshot_file));
+		
+	close(disk_image);
+
+	disk_image=open("/tmp/disk_image.img", O_RDONLY);
+	device=open(device_path, O_RDWR, 0660);
 
 	fiemap = read_fiemap(disk_image);
 
@@ -498,6 +469,7 @@ void restore_fs(char *device_path)
 	}
 	close(disk_image);
 	close(device);
+	umount_device(mount_point);
 }
 
 int umount_snapshot(const char *fpath, const struct stat *sb, int type)
@@ -522,7 +494,7 @@ int umount_device(char *device)
 	int error;
 
 	if((error = ftw(snapshot_dir, umount_snapshot, 10)) != 0) {
-		printf("\nCannot walk throught fs");
+		printf("\nCannot walk throught fs pop");
 		return error;
 	}
 
@@ -533,42 +505,46 @@ int umount_device(char *device)
 	return error;
 }
 
-int main(int argc, char **argv)
+int parse_cmd_line(int argc, char *argv[])
 {
-        int fd, error, disk_image, should_lvm_export=0;
-	char command[MAX], snapshot_file[MAX];
-	char *snapshot_name;
-	struct snapshot_list *node;
-	struct fiemap *fiemap;
-
-	list_head = NULL;
-	lvm_export = NULL;
+	int should_lvm_export = 0;
 
         if (argc < 4) {
 		printf("\next4dev_restore <device> <snapshot> [lvmexport/revert]\n");
                 exit(EXIT_FAILURE);
         }
 
-	/*
-	 * Should export to LVM ?
-	 */
 	if(argc == 4 && !strcmp(argv[3],"lvmexport"))
 		should_lvm_export = 1;
 
 	if(mkdir(MNT,S_IRWXU | S_IRWXG | S_IROTH | S_IXOTH) != 0) {
 		printf("\nFailed to create mount point");
-		exit(EXIT_FAILURE);
+                exit(EXIT_FAILURE);
 	}
 	strcpy(mount_point, MNT);
 
 	if(mount(argv[1], mount_point, "ext4dev", 0, NULL)) {
 		printf("\nError while mounting");
-		exit(EXIT_FAILURE);
+                exit(EXIT_FAILURE);
 	}
 
 #warning "Remove snapshot.ext4dev config command"
 	sprintf(command, "snapshot.ext4dev config %s %s",argv[1],mount_point);
 	system(command);
+
+	return should_lvm_export;	
+}
+
+int main(int argc, char **argv)
+{
+        int should_lvm_export=0;
+	struct snapshot_list *node;
+	struct fiemap *fiemap;
+
+	list_head = NULL;
+	lvm_export = NULL;
+
+	should_lvm_export = parse_cmd_line(argc, argv);
 
 	sprintf(snapshot_dir, "%s/.snapshots", mount_point);
 	sprintf(snapshot_file, "%s/%s", snapshot_dir, argv[2]);
@@ -584,70 +560,22 @@ int main(int argc, char **argv)
 
 	printf("\nFTW completed");
 
+	/*
+	 * Setting up a pointer to target snapshot
+	 */
 	set_target_snapshot(snapshot_file);
 
 	read_list();
 	printf("\n Target : %s \n",target_snapshot->name);
 
-	if(should_lvm_export) {
+	if(should_lvm_export)
 		create_lvmexport();
-		return 0;
-	}
-	disk_image = creat("/tmp/disk_image.img", 0777);
-	
-	if(list_head == NULL) {
-		printf("\nNo snapshot taken");
-		umount_device(argv[1]);
-		exit(EXIT_FAILURE);
-	}
-
-	node = list_head;
-
-	/*
-	 * Iterate over the list, capture all changed blocks from snapshots
-	 * dump them to temporary disk image
-	 */
-
-	do {
-		snapshot_name = node->name + strlen(snapshot_dir) + 1;
-
-#warning "Implement snapshot enable using ioctls"
-
-		sprintf(command, "snapshot.ext4dev enable %s", snapshot_name);
-		printf("\n%s\n",command);
-		system(command);
-		
-		if ((fd = open(node->name, O_RDONLY)) < 0) {
-			fprintf(stderr, "Cannot open file %s\n", node->name);
-			umount_device(argv[1]);
-			exit(EXIT_FAILURE);
-		}
-		else if ((fiemap = read_fiemap(fd)) != NULL)
-			dump_fiemap(fiemap, fd, disk_image, should_lvm_export);
-		else {
-			printf("\nfiemap ioctl failed");
-			umount_device(argv[1]);
-			exit(EXIT_FAILURE);
-		}
-		close(fd);
-		node = node->next;
-		sprintf(command,"%s/%s",snapshot_dir,snapshot_name);
-		printf("com : %s \t file : %s\n",command,snapshot_file);
-	} while(strcmp(command, snapshot_file));
-	
-	close(disk_image);
-				
-	if(umount_device(mount_point)) {
-		printf("\nError while umounting");
-		exit(EXIT_FAILURE);
-	}
-	if(!should_lvm_export) {
+	else {
 		restore_fs(argv[1]);
-
+		sleep(1);
 		sprintf(command, "fsck.ext4dev -fxy %s", argv[1]);
 		system(command);
 	}
-	else
-		read_lvm_export_metadata();
+
         exit(EXIT_SUCCESS);
 }
