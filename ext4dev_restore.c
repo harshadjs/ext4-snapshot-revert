@@ -22,7 +22,12 @@
 #define SNAPSHOT_SHIFT 0
 #define MAX 50
 #define MAX_FILE_NAME 1024
-#define SECTOR_SIZE 4096
+#define SECTOR_SIZE 512
+
+#define SNAP_MAGIC 0x70416e53 /* 'SnAp' */
+#define SNAPSHOT_DISK_VERSION 1
+
+#define INITIAL_OFFSET 512
 
 /*
  * List of snapshots sorted according to their IDs
@@ -35,17 +40,22 @@ struct snapshot_list {
 	struct snapshot_list *prev;
 } *list_head, *target_snapshot;
 
-struct lvm_export {
-	unsigned long *area;
-	struct lvm_export *next;
-} *lvm_export;
-
 struct disk_exception {
     uint64_t old_chunk;
     uint64_t new_chunk;
 };
 
-char command[MAX], snapshot_file[MAX], snapshot_dir[MAX], mount_point[MAX];
+struct mdata_range {
+	unsigned long blk_no;
+	uint64_t start, end;
+	struct mdata_range *next;
+} *mdata_range_list_head;
+
+char device_path[MAX],
+	command[MAX], 
+	snapshot_file[MAX], 
+	snapshot_dir[MAX], 
+	mount_point[MAX];
 
 /*
  * This function called from ftw adds snapshots one by one into the snapshot list.
@@ -146,29 +156,6 @@ int set_target_snapshot(char *snapshot_file)
 }
 
 /*
- * Helper function for LVM_export
- * Function reads all metadata chunks
- */
-int read_lvm_export_metadata(void)
-{
-	struct lvm_export *p=lvm_export;
-	unsigned long offset = 0, data_in_chunk;
-	int done = 0;
-	
-	printf("\nMetadata Chunk : ");
-	while(!done) {
-		data_in_chunk = *(unsigned long *)(p->area+offset);
-		if(data_in_chunk == -1)
-			done = 1;
-		else
-			printf(" %ld ", data_in_chunk);
-		offset = (offset + 1) % SECTOR_SIZE;
-		if(!offset)
-			p=p->next;
-	}
-}
-
-/*
  * Helper function for reading the snapshot list
  */
 int read_list(void)
@@ -238,94 +225,197 @@ struct fiemap *read_fiemap(int fd)
         return fiemap;
 }
 
+int is_full(int offset)
+{
+	if((offset) % (SECTOR_SIZE/8) == 2)
+		return 1;
+	return 0;
+}
+
+int sync_to_lvm_image(uint64_t *exception_mdata, int snapshot_fd)
+{
+	int i, j;
+	uint64_t offset;
+	char buf[SECTOR_SIZE];
+	int lvm_cow_store = open(LVM_IMAGE_PATH, O_RDWR|O_CREAT);
+	if(lvm_cow_store < 0) {
+		printf("\nLVM cow store absent");
+		exit(EXIT_FAILURE);
+	}
+
+	if(snapshot_fd < 0) {
+		printf("\nSnapshot file not open");
+		exit(EXIT_FAILURE);
+	}
+	lseek(lvm_cow_store, 0, SEEK_END);
+	printf("SYNCING at offset %ld ... ", lseek(lvm_cow_store, 0, SEEK_CUR));	
+	write(lvm_cow_store, exception_mdata, SECTOR_SIZE);
+
+	for(i=0; i < (SECTOR_SIZE>>4); i++) {
+		offset = exception_mdata[2*i];
+		lseek(snapshot_fd, offset * SECTOR_SIZE, SEEK_SET);
+		read(snapshot_fd, buf, SECTOR_SIZE);
+			
+		lseek(lvm_cow_store, 0, SEEK_END);
+		write(lvm_cow_store, buf, SECTOR_SIZE);
+	}
+	close(lvm_cow_store);
+	memset((void *)exception_mdata, 0, SECTOR_SIZE);
+	printf("Done..\n\n");
+	
+	return 1;
+}
+
+int init_snapshot_image(void)
+{
+	int lvm_cow_store;
+	uint32_t header[128];
+
+	if((lvm_cow_store = open(LVM_IMAGE_PATH, O_CREAT | O_RDWR | O_TRUNC)) < 0)
+		return -1;
+
+	header[0] = SNAP_MAGIC;
+	header[1] = 1;
+	header[2] = SNAPSHOT_DISK_VERSION;
+	header[3] = SECTOR_SIZE/512;
+ 
+	write(lvm_cow_store, (void *)header, 512);
+	close(lvm_cow_store);
+	return 1;
+}
+
 int create_lvmexport(void)
 {
 	struct fiemap *fiemap;
-	int fd, lvm_image, offset=0, mdata_blocks=1;
+	int fd, lvm_cow_store, new_offset=1, offset=0, counter=2, mdata_blocks=0;
 	int i, j, k, location;
 	char command[MAX], *snapshot_name;
 	struct snapshot_list *p;
 	uint64_t *exception_mdata;
 	struct disk_exception de;
+	struct mdata_range *p_range = NULL;
 
 	p = target_snapshot;
 
 	exception_mdata = (uint64_t *)malloc(SECTOR_SIZE);
-	memset(exception_mdata, -1, SECTOR_SIZE);
+	if(!exception_mdata) {
+		printf("\nOut of memory");
+		exit(EXIT_FAILURE);
+	}
 
-	//	lvm_image = open(LVM_IMAGE_PATH, O_WRONLY|O_CREAT);
+	memset(exception_mdata, 0, SECTOR_SIZE);
+
+	if(!init_snapshot_image()) {
+		printf("\nFailed to initialize snapshot image");
+		exit(EXIT_FAILURE);
+	}
 
 	while(p) {
 		if ((fd = open(p->name, O_RDONLY)) < 0) {
 			fprintf(stderr, "Cannot open file %s\n", p->name);
 			return 0;
-		}	
+		}
 		
 		snapshot_name = p->name + strlen(snapshot_dir) + 1;
 		sprintf(command, "snapshot.ext4dev enable %s", snapshot_name);
 		system(command);
-		
-		offset = 0;
+		printf("\n* * * * * * * * * * * * * * * * * * * Snapshot : %s * * * * * * * * * * * * * * * * * * * *\n\n", snapshot_name);
+
 		fiemap = read_fiemap(fd);
 
 		for (i=0;i<fiemap->fm_mapped_extents;i++) {
 			if(fiemap->fm_extents[i].fe_logical - SNAPSHOT_SHIFT !=
 			   fiemap->fm_extents[i].fe_physical) {
 
-				for(j=0,k=0; j < (fiemap->fm_extents[i].fe_length) / SECTOR_SIZE; j++,k+=2) {
-					location = search_in_area(exception_mdata, 2*(offset+j),
-								  (fiemap->fm_extents[i].fe_logical 
+				for(j=0; j < (fiemap->fm_extents[i].fe_length) / SECTOR_SIZE; j++) {
+					printf("Searching for %ld ... ", (long)(fiemap->fm_extents[i].fe_logical
+										     - SNAPSHOT_SHIFT)/SECTOR_SIZE + j);
+					location = search_in_area(exception_mdata,
+								  2*(offset+j),
+								  (fiemap->fm_extents[i].fe_logical
 								   - SNAPSHOT_SHIFT)/SECTOR_SIZE + j);
-					printf("\nSearching for %ld",   (fiemap->fm_extents[i].fe_logical 
-									   - SNAPSHOT_SHIFT)/SECTOR_SIZE + j);
+				
 					if(location < 0) {
 						/*
 						 * The is not present in export list
 						 * Writing metadata to metadata chunk
 						 */
+				
 						printf(" - Not Found - ");
-						de.old_chunk 
+						de.old_chunk
 							= fiemap->fm_extents[i].fe_logical/SECTOR_SIZE
 							+ j - SNAPSHOT_SHIFT/SECTOR_SIZE;
-						de.new_chunk = 0;
-						exception_mdata[2*offset+k] = de.old_chunk;
-						exception_mdata[2*offset+k+1] = de.new_chunk;
-						printf("Writing at %d,%d\n", 2*offset+k,2*offset+k+1);
+						de.new_chunk = new_offset++ + INITIAL_OFFSET/SECTOR_SIZE;
+						exception_mdata[2*offset] = de.old_chunk;
+						exception_mdata[2*offset+1] = de.new_chunk;
+						printf("Writing at %d,%d\n", 2*offset,2*offset+1);
+						offset++;
+						counter += 2;
+						if(is_full(counter)) {
+							printf("\nMdata Chunk Full ... ");
+							exception_mdata[2*offset+k+1] = new_offset + INITIAL_OFFSET/SECTOR_SIZE;
+							offset = 0;
+							new_offset++;
+
+							if(!p_range) {
+								p_range =
+									(struct mdata_range *)malloc(sizeof(struct mdata_range));
+								if(!p_range) {
+									printf("\nOut of memory");
+									exit(EXIT_FAILURE);
+								}
+								p_range->blk_no = mdata_blocks;
+								p_range->start = exception_mdata[0];
+								p_range->end = exception_mdata[(SECTOR_SIZE>>3)-2];
+								p_range->next = NULL;
+								mdata_range_list_head = p_range;
+							}
+							else {
+								p_range->next = (struct mdata_range *)malloc(sizeof(struct mdata_range));
+								if(!p_range->next) {
+									printf("\nOut of memory");
+									exit(EXIT_FAILURE);
+								}
+								p_range = p_range->next;
+								p_range->start = exception_mdata[0];
+								p_range->end = exception_mdata[(SECTOR_SIZE>>3)-2];
+								p_range->blk_no = mdata_blocks;
+								p_range->next = NULL;
+							}
+							sync_to_lvm_image(exception_mdata, fd);
+							mdata_blocks++;
+						}
 					}
 					else {
-						printf("\nFound\n");
+						printf(" - Found\n");
 					}
 					/*
 					 * Block already present
 					 * Just overwrite the corresponding data chunk
 					 */
 				}
-				offset = offset +(fiemap->fm_extents[i].fe_length/SECTOR_SIZE);
-				
-				/*
-				 * offset might exceed SECTOR_SIZE
-				 * in that case chunks are full
-				 * allocate one more chunk
-				 */
-				if(offset % (SECTOR_SIZE * mdata_blocks) == 0) {
-					uint64_t *temp;
-					
-					temp = (uint64_t *)malloc(SECTOR_SIZE * (mdata_blocks+1));
-					memcpy(temp, exception_mdata, SECTOR_SIZE*mdata_blocks);
-					free(exception_mdata);
-					exception_mdata = temp;
-					mdata_blocks++;
-				}
-	       		}
+			}
 		}
 		p = p->prev;
+		if(!p) {
+			printf("\nDone!!...Final Sync...");
+			sync_to_lvm_image(exception_mdata, fd);
+		}
 		close(fd);
 	}
 
-	printf("\nNumber of metadata blocks : %d", mdata_blocks);
-	printf("\nException Store\n");
-	for(i=0; exception_mdata[i] != -1 ;i+=2) {
-		printf("\n%ld\t%ld\n", exception_mdata[i], exception_mdata[i+1]);
+	lvm_cow_store = open(LVM_IMAGE_PATH, O_RDONLY);
+	printf("Number of metadata blocks : %d", mdata_blocks);
+	close(lvm_cow_store);
+
+	p_range = mdata_range_list_head;
+	printf("\nException mdata\nid\tstart\tend\n");
+	while(p_range) {
+		printf("%ld\t%ld\t%ld\n",
+		       p_range->blk_no, 
+		       p_range->start,
+		       p_range->end);
+		p_range = p_range->next;
 	}
 	umount_device(mount_point);
 	return 0;
@@ -343,7 +433,6 @@ void dump_fiemap(struct fiemap *fiemap, int snapshot_file, int disk_image)
 	void *buf;
 	static int full=0;
 	static unsigned long offset=0;
-	static struct lvm_export *p=NULL;	
 
 	for (i=0;i<fiemap->fm_mapped_extents;i++) {
 		if(fiemap->fm_extents[i].fe_logical - SNAPSHOT_SHIFT !=
@@ -362,29 +451,40 @@ void dump_fiemap(struct fiemap *fiemap, int snapshot_file, int disk_image)
 /*
  * search_in_area searches for key in area from start to end
  */
-int search_in_area(uint64_t *area, int end, uint64_t key)
+int search_in_area(uint64_t *current_area, int end, uint64_t key)
 {
-	int start=0, location;
+	int this=1, start=0, location, lvm_cow_store;
+	uint64_t area[SECTOR_SIZE>>3];
+	struct mdata_range *p = mdata_range_list_head;
+	lvm_cow_store = open(LVM_IMAGE_PATH, O_RDWR);
 	
-	while(start<=end) {
-		location = (start+end)/2;
-		if(key == area[location*2])
-			return location;
-		else if(key < area[location*2])
-			end = location - 2;
-		else
-			start = location + 2;
+	//	printf("\nTraversing mdata range list (key = %ld): |", key);
+	while(p) {
+		//	printf("%ld %ld|",p->start, p->end);
+		if((key >= p->start) && (key <= p->end)) {
+			lseek(lvm_cow_store,
+			      INITIAL_OFFSET +
+			      p->blk_no * (SECTOR_SIZE>>4) * SECTOR_SIZE +
+			      p->blk_no * SECTOR_SIZE,
+			      SEEK_SET
+			      );
+			read(lvm_cow_store, area, SECTOR_SIZE);
+			end = (SECTOR_SIZE>>3)-1;
+			this = 0;
+			break;
+		}
+		p = p->next;
 	}
+	close(lvm_cow_store);
 
-	/*	printf("\nKey = %ld Traversing : ", key);
-	while((start<=end) && (area[start] != key)) {
-		printf(" %ld ", area[start]);
+	if(this)
+		memcpy(area, current_area, SECTOR_SIZE);
+
+	while((start<=end) && (area[start] != key))
 		start += 2;
-	}
-	printf("\n");*/
 
 	if(start <= end)
-		return start;
+	return start;
 	return -1;
 }
 
@@ -392,7 +492,7 @@ int search_in_area(uint64_t *area, int end, uint64_t key)
  * Restores the device to the earlier snapshot.
  * Function assumes that the required disk image is created at /tmp/disk_image.img
  */
-void restore_fs(char *device_path)
+void restore_fs(void)
 {
 	int i, fd, error;
 	int device, disk_image;
@@ -517,6 +617,7 @@ int parse_cmd_line(int argc, char *argv[])
 	if(argc == 4 && !strcmp(argv[3],"lvmexport"))
 		should_lvm_export = 1;
 
+	strcpy(device_path, argv[1]);
 	if(mkdir(MNT,S_IRWXU | S_IRWXG | S_IROTH | S_IXOTH) != 0) {
 		printf("\nFailed to create mount point");
                 exit(EXIT_FAILURE);
@@ -542,13 +643,13 @@ int main(int argc, char **argv)
 	struct fiemap *fiemap;
 
 	list_head = NULL;
-	lvm_export = NULL;
+	mdata_range_list_head = NULL;
 
 	should_lvm_export = parse_cmd_line(argc, argv);
 
 	sprintf(snapshot_dir, "%s/.snapshots", mount_point);
 	sprintf(snapshot_file, "%s/%s", snapshot_dir, argv[2]);
-	
+
 	/*
 	 * Creating snapshot list
 	 */
@@ -571,9 +672,8 @@ int main(int argc, char **argv)
 	if(should_lvm_export)
 		create_lvmexport();
 	else {
-		restore_fs(argv[1]);
-		sleep(1);
-		sprintf(command, "fsck.ext4dev -fxy %s", argv[1]);
+		restore_fs();
+		sprintf(command, "fsck.ext4dev -fxp %s", argv[1]);
 		system(command);
 	}
 
