@@ -227,6 +227,7 @@ struct fiemap *read_fiemap(int fd)
 
 int is_full(int offset)
 {
+	printf("Offset %d, check %d\n", offset, (offset) % (SECTOR_SIZE/8));
 	if((offset) % (SECTOR_SIZE/8) == 2)
 		return 1;
 	return 0;
@@ -248,7 +249,7 @@ int sync_to_lvm_image(uint64_t *exception_mdata, int snapshot_fd)
 		exit(EXIT_FAILURE);
 	}
 	lseek(lvm_cow_store, 0, SEEK_END);
-	printf("SYNCING at offset %ld ... ", lseek(lvm_cow_store, 0, SEEK_CUR));	
+	printf("SYNCING at offset %lu ... ", lseek(lvm_cow_store, 0, SEEK_CUR));	
 	write(lvm_cow_store, exception_mdata, SECTOR_SIZE);
 
 	for(i=0; i < (SECTOR_SIZE>>4); i++) {
@@ -328,7 +329,7 @@ int create_lvmexport(void)
 			   fiemap->fm_extents[i].fe_physical) {
 
 				for(j=0; j < (fiemap->fm_extents[i].fe_length) / SECTOR_SIZE; j++) {
-					printf("Searching for %ld ... ", (long)(fiemap->fm_extents[i].fe_logical
+					printf("Searching for %lu ... ", (long)(fiemap->fm_extents[i].fe_logical
 										     - SNAPSHOT_SHIFT)/SECTOR_SIZE + j);
 					location = search_in_area(exception_mdata,
 								  2*(offset+j),
@@ -352,10 +353,11 @@ int create_lvmexport(void)
 						offset++;
 						counter += 2;
 						if(is_full(counter)) {
-							printf("\nMdata Chunk Full ... ");
-							exception_mdata[2*offset+k+1] = new_offset + INITIAL_OFFSET/SECTOR_SIZE;
+							printf("\nMdata Chunk Full ... \n");
+							exception_mdata[2*offset+1] = new_offset + INITIAL_OFFSET/SECTOR_SIZE;
 							offset = 0;
 							new_offset++;
+							printf("\nHere\n");
 
 							if(!p_range) {
 								p_range =
@@ -411,7 +413,7 @@ int create_lvmexport(void)
 	p_range = mdata_range_list_head;
 	printf("\nException mdata\nid\tstart\tend\n");
 	while(p_range) {
-		printf("%ld\t%ld\t%ld\n",
+		printf("%lu\t%llu\t%llu\n",
 		       p_range->blk_no, 
 		       p_range->start,
 		       p_range->end);
@@ -454,13 +456,17 @@ void dump_fiemap(struct fiemap *fiemap, int snapshot_file, int disk_image)
 int search_in_area(uint64_t *current_area, int end, uint64_t key)
 {
 	int this=1, start=0, location, lvm_cow_store;
+	static int is_superblock = 1;
 	uint64_t area[SECTOR_SIZE>>3];
 	struct mdata_range *p = mdata_range_list_head;
 	lvm_cow_store = open(LVM_IMAGE_PATH, O_RDWR);
 	
-	//	printf("\nTraversing mdata range list (key = %ld): |", key);
+	if(is_superblock) {
+		is_superblock = 0;
+		return -1;
+	}
+
 	while(p) {
-		//	printf("%ld %ld|",p->start, p->end);
 		if((key >= p->start) && (key <= p->end)) {
 			lseek(lvm_cow_store,
 			      INITIAL_OFFSET +
@@ -577,6 +583,9 @@ int umount_snapshot(const char *fpath, const struct stat *sb, int type)
 	char *snapshot_name;
 	char snapshot_mnt[MAX];
 	struct stat st_mnt;
+	
+	if(type != FTW_F)
+		return 0; 
 
 	snapshot_name = (char *)(fpath + strlen(snapshot_dir) + 1);
 	sprintf(snapshot_mnt, "%s@%s", mount_point, snapshot_name);
@@ -593,11 +602,9 @@ int umount_device(char *device)
 {
 	int error;
 
-	if((error = ftw(snapshot_dir, umount_snapshot, 10)) != 0) {
-		printf("\nCannot walk throught fs pop");
-		return error;
-	}
-
+	ftw(snapshot_dir, umount_snapshot, 10);
+		
+	printf("\numount : %s\n", device);
 	error = umount(device);
 	if(error)
 		return error;
@@ -669,8 +676,9 @@ int main(int argc, char **argv)
 	read_list();
 	printf("\n Target : %s \n",target_snapshot->name);
 
-	if(should_lvm_export)
+	if(should_lvm_export) {
 		create_lvmexport();
+	}
 	else {
 		restore_fs();
 		sprintf(command, "fsck.ext4dev -fxp %s", argv[1]);
