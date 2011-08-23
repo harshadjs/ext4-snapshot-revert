@@ -1,5 +1,11 @@
-This is Google Summer of Code 2011 repository.
+                   Extdev Restore Tool
 
-Abstract:
+This is Ext4 snapshot revert tool.
 
-In today's world, large number of packages are downloaded and installed. Considering this scenario there is a need to have a feature that would rollback the system to a state before the package was installed. The snapshots feature in a file system can be effectively used for the same. Yum currently has support for doing snapshots in btrfs before starting a transaction. It would be a good idea to add support for Ext4 snapshots in yum.
+The implementation of snapshot feature in ext4 filesystem is under progress (at https://github.com/amir73il/ext4-snapshots).
+
+This tool implements feature of 'Revert to specified snapshot' in Ext4 file system.
+
+The tool exports ext4 snapshot to lvm snapshot format. This exported lvm volume is then merged into original ext4 volume by lvm userspace tools. Also, revert can take place without lvm userspace tools. In that case, the tool itself writes all the exceptions directly to the block device. This mode is useful for debugging purposes.
+
+Installation instructions and Usage can be found on Github wiki page.
