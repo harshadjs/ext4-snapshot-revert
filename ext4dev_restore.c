@@ -26,6 +26,7 @@
 
 #define SNAP_MAGIC 0x70416e53 /* 'SnAp' */
 #define SNAPSHOT_DISK_VERSION 1
+#define SNAPSHOT_DELETED_FL 0x30
 
 #define INITIAL_OFFSET SECTOR_SIZE
 /*
@@ -78,6 +79,12 @@ int add_to_snapshot_list(const char *fpath, const struct stat *sb, int type)
 	if(fgetversion(fpath, &id) < 0) {
 		fprintf(stderr, "\nFailed to get snapshot id");
 		return -1;
+	}
+
+	if(is_deleted(fpath)) {
+		if(verbose) 
+			fprintf(stderr, "\nDeleted snapshot : %s\n", fpath);
+		return 0;
 	}
 
 	if(list_head == NULL) {
@@ -154,7 +161,7 @@ int set_target_snapshot(char *snapshot_file)
 		target_snapshot = t;
 		return 1;
 	}
-	fprintf(stderr, "Snapshot %s not found\n", snapshot_file);
+	fprintf(stderr, "Snapshot %s not found (or deleted)\n", snapshot_file);
 	umount_device(mount_point);
 	rmdir(mount_point);
 	exit(EXIT_FAILURE);
@@ -228,6 +235,16 @@ struct fiemap *read_fiemap(int fd)
         }
 
         return fiemap;
+}
+
+/*
+ * Is deleted snapshot?
+ */
+int is_deleted(char *snapshot)
+{
+	unsigned long flags=0;	
+	fgetsnapflags(snapshot, &flags);
+	return (flags & SNAPSHOT_DELETED_FL);
 }
 
 /*
@@ -634,9 +651,12 @@ int umount_device(char *device)
 	ftw(snapshot_dir, umount_snapshot, 10);
 	if(verbose)	
 		fprintf(stderr, "\numount : %s\n", device);
-	error = umount(device);
-	if(error)
+	error = umount(mount_point);
+	if(error) {
+		printf("\nerror umount device : %d\n", error);
 		return error;
+	}
+	       
 	rmdir(MNT);
 	return error;
 }
@@ -704,7 +724,7 @@ int main(int argc, char **argv)
 	 */
 	if(ftw(snapshot_dir, add_to_snapshot_list, 10) != 0) {
 		fprintf(stderr, "\nCannot walk throught fs");
-		umount_device(argv[1]);
+		umount_device(device_path);
 		exit(EXIT_FAILURE);
 	}
 
@@ -714,7 +734,7 @@ int main(int argc, char **argv)
 	set_target_snapshot(snapshot_file);
 
 	if(verbose)
-		fprintf(stderr, "\n Target : %s \n",target_snapshot->name);
+		fprintf(stderr, "\nTarget : %s \n",target_snapshot->name);
 
 	if(should_lvm_export) {
 		create_lvmexport();
