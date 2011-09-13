@@ -17,7 +17,6 @@
 #include "e2p/e2p.h"
 
 #define MNT "/mnt/temp"
-#define LVM_IMAGE_PATH "./lvm_image.img"
 
 #define SNAPSHOT_SHIFT 0
 #define MAX 50
@@ -59,9 +58,10 @@ char device_path[MAX]={0},
 	command[MAX], 
 	snapshot_file[MAX]={0}, 
 	snapshot_dir[MAX], 
-	mount_point[MAX];
+	mount_point[MAX],
+	lvm_image_path[MAX];
 
-int verbose;
+int mdata_blocks=0, verbose;
 
 /*
  * This function called from ftw adds snapshots one by one into the snapshot list.
@@ -267,7 +267,7 @@ int sync_to_lvm_image(uint64_t *exception_mdata, int snapshot_fd)
 	int i, j;
 	uint64_t offset;
 	char buf[SECTOR_SIZE];
-	int lvm_cow_store = open(LVM_IMAGE_PATH, O_RDWR|O_CREAT);
+	int lvm_cow_store = open(lvm_image_path, O_RDWR);
 	if(lvm_cow_store < 0) {
 		fprintf(stderr, "\nLVM cow store absent");
 		exit(EXIT_FAILURE);
@@ -277,7 +277,10 @@ int sync_to_lvm_image(uint64_t *exception_mdata, int snapshot_fd)
 		fprintf(stderr, "\nSnapshot file not open");
 		exit(EXIT_FAILURE);
 	}
-	lseek(lvm_cow_store, 0, SEEK_END);
+	lseek(lvm_cow_store, 
+	      INITIAL_OFFSET + (mdata_blocks * SECTOR_SIZE) +
+	      (SECTOR_SIZE * (SECTOR_SIZE >> 4)) * (mdata_blocks),
+	      SEEK_SET);
 	if(verbose)
 		fprintf(stderr, "SYNCING at offset %lu ... ", lseek(lvm_cow_store, 0, SEEK_CUR));	
 	write(lvm_cow_store, exception_mdata, SECTOR_SIZE);
@@ -287,7 +290,6 @@ int sync_to_lvm_image(uint64_t *exception_mdata, int snapshot_fd)
 		lseek(snapshot_fd, offset * SECTOR_SIZE, SEEK_SET);
 		read(snapshot_fd, buf, SECTOR_SIZE);
 			
-		lseek(lvm_cow_store, 0, SEEK_END);
 		write(lvm_cow_store, buf, SECTOR_SIZE);
 	}
 	close(lvm_cow_store);
@@ -304,16 +306,17 @@ int sync_to_lvm_image(uint64_t *exception_mdata, int snapshot_fd)
 int init_snapshot_image(void)
 {
 	int lvm_cow_store;
-	uint32_t header[128];
+	uint32_t header[128]={0};
 
-	if((lvm_cow_store = open(LVM_IMAGE_PATH, O_CREAT | O_RDWR | O_TRUNC)) < 0)
+	if((lvm_cow_store = open(lvm_image_path, O_CREAT | O_RDWR | O_TRUNC)) < 0)
 		return -1;
 
 	header[0] = SNAP_MAGIC;
 	header[1] = 1;
 	header[2] = SNAPSHOT_DISK_VERSION;
 	header[3] = SECTOR_SIZE/512;
- 
+
+	lseek(lvm_cow_store, 0, SEEK_SET);
 	write(lvm_cow_store, (void *)header, 512);
 	close(lvm_cow_store);
 	return 1;
@@ -325,7 +328,7 @@ int init_snapshot_image(void)
 int create_lvmexport(void)
 {
 	struct fiemap *fiemap;
-	int fd, lvm_cow_store, new_offset=1, offset=0, counter=2, mdata_blocks=0;
+	int fd, lvm_cow_store, new_offset=1, offset=0, counter=2;
 	int i, j, k, location;
 	char command[MAX], *snapshot_name;
 	struct snapshot_list *p;
@@ -492,7 +495,7 @@ int search_in_area(uint64_t *current_area, int end, uint64_t key)
 	static int is_superblock = 1;
 	uint64_t area[SECTOR_SIZE>>3];
 	struct mdata_range *p = mdata_range_list_head;
-	lvm_cow_store = open(LVM_IMAGE_PATH, O_RDWR);
+	lvm_cow_store = open(lvm_image_path, O_RDWR);
 	
 	if(is_superblock) {
 		is_superblock = 0;
@@ -636,8 +639,9 @@ void help()
 {
     fputs("Usage: ext4dev_restore [options] -s <snapshot_device> -d <output_device>\n\n", stderr);
     fputs("Options:\n", stderr);
-    fputs("-s <file>\text4 snapshot\n", stderr);
+    fputs("-i <file>\text4 snapshot\n", stderr);
     fputs("-d <file>\tThe target device\n", stderr);
+    fputs("-o <file>\tLVM image path\n", stderr);
     fputs("-r\t\tRevert mode. Reverts the device to specifed snapshot.\n", stderr);
     fputs("-l\t\tLVM export mode. Exports ext4 snapshot to LVM snapshot format.\n", stderr);
     fputs("-v\t\tBe verbose\n\n", stderr);
@@ -668,10 +672,11 @@ int parse_cmd_line(int argc, char *argv[])
 
 	verbose = 0;
 
-	while((c = getopt(argc, argv, "s:d:lrvh")) != -1) {
+	while((c = getopt(argc, argv, "i:d:o:lrvh")) != -1) {
 		switch(c) {
-		case 's': strcpy(snapshot_file, optarg); break;
+		case 'i': strcpy(snapshot_file, optarg); break;
 		case 'd': strcpy(device_path, optarg); break;
+		case 'o': strcpy(lvm_image_path, optarg); break;
 		case 'l': should_lvm_export = 1; break;
 		case 'r': should_lvm_export = 0; break;
 		case 'v': verbose = 1; break;
@@ -679,8 +684,8 @@ int parse_cmd_line(int argc, char *argv[])
 		default : help(); exit(EXIT_SUCCESS);
 		}
 	}
-	if(device_path[0]==0 || snapshot_file[0]==0) {
-		fprintf(stderr, "Device or snapshot not specified.\n");
+	if(device_path[0]==0 || snapshot_file[0]==0 || lvm_image_path[0]==0) {
+		fprintf(stderr, "Device or snapshot or output not specified.\n");
 		help();
 		exit(EXIT_FAILURE);
 	}
