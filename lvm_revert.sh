@@ -4,7 +4,7 @@ VG="$1"
 LV="$2"
 SNAP="$3"
 LVM_SNAP="lvm_restore_snap_$SNAP"
-EXT4DEV_RESTORE="./ext4dev_restore"
+EXT4DEV_RESTORE="/sbin/ext4dev_restore"
 TEST_FILE="/tmp/test_file"
 
 # check for correct command line params
@@ -53,14 +53,21 @@ if [ $? -ne 0 ] ; then
     lvremove -f $VG/$LVM_SNAP
     exit 1;
 fi
-vgchange -a n $VG
-vgchange -a y $VG
-lvconvert --merge $VG/$LVM_SNAP
-
+cat /etc/mtab | grep /dev/mapper/$VG-$LV > /dev/null
 if [ $? -ne 0 ] ; then
-    echo "Merging Failed"
-    lvremove -f $VG/$LVM_SNAP
-    exit 1;
+    vgchange -a n $VG
+    vgchange -a y $VG
+    lvconvert --merge $VG/$LVM_SNAP > /dev/null
+    if [ $? -ne 0 ] ; then
+	echo "Merging failed"
+	exit 1;
+    fi
+    fsck.ext4dev -fxp /dev/$VG/$LV
+else
+    echo "LV mounted. Run fsck manually after completion of merging"
+    lvconvert --merge $VG/$LVM_SNAP > /dev/null
+    if [ $? -ne 0 ] ; then
+	echo "Merging failed"
+	exit 1;
+    fi
 fi
-
-fsck.ext4dev -fxp /dev/$VG/$LV
