@@ -21,7 +21,7 @@
 #define SNAPSHOT_SHIFT 0
 #define MAX 50
 #define MAX_FILE_NAME 1024
-#define SECTOR_SIZE 512
+#define SECTOR_SIZE 4096
 
 #define SNAP_MAGIC 0x70416e53 /* 'SnAp' */
 #define SNAPSHOT_DISK_VERSION 1
@@ -34,7 +34,7 @@
 
 struct snapshot_list {
 	char name[MAX_FILE_NAME];
-	int id;
+	int id, deleted;
 	struct snapshot_list *next;
 	struct snapshot_list *prev;
 } *list_head, *target_snapshot;
@@ -72,6 +72,7 @@ int add_to_snapshot_list(const char *fpath, const struct stat *sb, int type)
 {	
 	struct snapshot_list *list_node;
 	unsigned long id;
+	int deleted;
 
 	if(type != FTW_F)
 		return 0; 
@@ -84,13 +85,16 @@ int add_to_snapshot_list(const char *fpath, const struct stat *sb, int type)
 	if(is_deleted(fpath)) {
 		if(verbose) 
 			fprintf(stderr, "\nDeleted snapshot : %s\n", fpath);
-		return 0;
+		deleted = 1;
 	}
+	else
+		deleted = 0;
 
 	if(list_head == NULL) {
 		list_node = (struct snapshot_list *)malloc(sizeof(struct snapshot_list));
 		strcpy(list_node->name, fpath);
 		list_node->id = id;
+		list_node->deleted = deleted;
 		list_head = list_node;
 		list_head->next = NULL;
 		list_head->prev = NULL;
@@ -99,6 +103,7 @@ int add_to_snapshot_list(const char *fpath, const struct stat *sb, int type)
 		list_node = (struct snapshot_list *)malloc(sizeof(struct snapshot_list));
 		strcpy(list_node->name, fpath);
 		list_node->id = id;
+		list_node->deleted = deleted;
 
 		if(list_head->id < id) {
 			list_node->next = list_head;
@@ -119,6 +124,7 @@ int add_to_snapshot_list(const char *fpath, const struct stat *sb, int type)
 			list_node = (struct snapshot_list *)malloc(sizeof(struct snapshot_list));
 			strcpy(list_node->name, fpath);
 			list_node->id = id;
+			list_node->deleted = deleted;
 
 			list_node->next = list_head;
 			list_node->prev = NULL;
@@ -136,6 +142,7 @@ int add_to_snapshot_list(const char *fpath, const struct stat *sb, int type)
 			temp = (struct snapshot_list *)malloc(sizeof(struct snapshot_list));
 			strcpy(temp->name, fpath);
 			temp->id = id;
+			temp->deleted = deleted;
 			temp->next = list_node->next;
 			if(temp->next)
 				temp->next->prev = temp;
@@ -157,7 +164,7 @@ int set_target_snapshot(char *snapshot_file)
 	while(t && strcmp(t->name, snapshot_file))
 		t = t->next;
 
-	if(t && !strcmp(t->name, snapshot_file)) {
+	if(t && !strcmp(t->name, snapshot_file) && !(t->deleted)) {
 		target_snapshot = t;
 		return 1;
 	}
@@ -258,14 +265,13 @@ int is_full(int offset)
 }
 
 /*
- * Sync_to_lvm_image flushes in memory exception_mdata and corresponding data chunks
- * to the LVM image
+ * this function flushes in memory exception_mdata to the LVM image
  * Called when in memory mdata chunk is full
  */
-int sync_to_lvm_image(uint64_t *exception_mdata, int snapshot_fd)
+int write_exception_mdata_to_disk(uint64_t *exception_mdata)
 {
 	int i, j;
-	uint64_t offset;
+	struct disk_exception *de;
 	char buf[SECTOR_SIZE];
 	int lvm_cow_store = open(lvm_image_path, O_RDWR);
 	if(lvm_cow_store < 0) {
@@ -273,10 +279,6 @@ int sync_to_lvm_image(uint64_t *exception_mdata, int snapshot_fd)
 		exit(EXIT_FAILURE);
 	}
 
-	if(snapshot_fd < 0) {
-		fprintf(stderr, "\nSnapshot file not open");
-		exit(EXIT_FAILURE);
-	}
 	lseek(lvm_cow_store, 
 	      INITIAL_OFFSET + (mdata_blocks * SECTOR_SIZE) +
 	      (SECTOR_SIZE * (SECTOR_SIZE >> 4)) * (mdata_blocks),
@@ -285,15 +287,6 @@ int sync_to_lvm_image(uint64_t *exception_mdata, int snapshot_fd)
 		fprintf(stderr, "SYNCING at offset %lu ... ", lseek(lvm_cow_store, 0, SEEK_CUR));	
 	write(lvm_cow_store, exception_mdata, SECTOR_SIZE);
 
-	for(i=0; i < (SECTOR_SIZE>>4); i++) {
-		offset = exception_mdata[2*i];
-		lseek(snapshot_fd, offset * SECTOR_SIZE, SEEK_SET);
-		read(snapshot_fd, buf, SECTOR_SIZE);
-			
-		write(lvm_cow_store, buf, SECTOR_SIZE);
-	}
-	close(lvm_cow_store);
-	memset((void *)exception_mdata, 0, SECTOR_SIZE);
 	if(verbose)
 		fprintf(stderr, "Done..\n\n");
 	
@@ -306,7 +299,7 @@ int sync_to_lvm_image(uint64_t *exception_mdata, int snapshot_fd)
 int init_snapshot_image(void)
 {
 	int lvm_cow_store;
-	uint32_t header[128]={0};
+	uint32_t header[SECTOR_SIZE/4]={0};
 
 	if((lvm_cow_store = open(lvm_image_path, O_CREAT | O_RDWR | O_TRUNC)) < 0)
 		return -1;
@@ -317,8 +310,36 @@ int init_snapshot_image(void)
 	header[3] = SECTOR_SIZE/512;
 
 	lseek(lvm_cow_store, 0, SEEK_SET);
-	write(lvm_cow_store, (void *)header, 512);
+	write(lvm_cow_store, (void *)header, SECTOR_SIZE);
 	close(lvm_cow_store);
+	return 1;
+}
+
+/*
+ * writes given exception to disk
+ */
+int write_to_disk(struct disk_exception de, int snapshot_fd)
+{
+	char buf[SECTOR_SIZE];
+	int lvm_cow_store = open(lvm_image_path, O_RDWR);
+
+	if(lvm_cow_store < 0) {
+		fprintf(stderr, "\nLVM cow store absent");
+		exit(EXIT_FAILURE);
+	}
+
+	if(snapshot_fd < 0) {
+		fprintf(stderr, "\nSnapshot file not open");
+		exit(EXIT_FAILURE);
+	}
+	lseek(snapshot_fd,
+	      de.old_chunk * SECTOR_SIZE,
+	      SEEK_SET);
+	read(snapshot_fd, buf, SECTOR_SIZE);
+	lseek(lvm_cow_store,
+	      de.new_chunk * SECTOR_SIZE,
+	      SEEK_SET);
+	write(lvm_cow_store, buf, SECTOR_SIZE);
 	return 1;
 }
 
@@ -352,14 +373,22 @@ int create_lvmexport(void)
 	}
 
 	while(p) {
+		if(p->deleted) {
+			/*
+			 * Currently FS does not allow fiemap ioctl on 
+			 * deleted snapshots. But while reverting fiemaps
+			 * of deleted snapshots need to be read.
+			 */
+			if(verbose)
+				fprintf(stderr, "Skipping deleted snapshot %s", p->name);
+			continue;
+		}
 		if ((fd = open(p->name, O_RDONLY)) < 0) {
 			fprintf(stderr, "Cannot open file %s\n", p->name);
 			return 0;
 		}
 		
 		snapshot_name = p->name + strlen(snapshot_dir) + 1;
-		sprintf(command, "snapshot.ext4dev enable %s", snapshot_name);
-		system(command);
 		fprintf(stderr, "\nExporting Snapshot : %s ... ", snapshot_name);
 
 		fiemap = read_fiemap(fd);
@@ -393,6 +422,8 @@ int create_lvmexport(void)
 						exception_mdata[2*offset+1] = de.new_chunk;
 						if(verbose)						
 							fprintf(stderr, "Writing at %d,%d\n", 2*offset,2*offset+1);
+						write_to_disk(de, fd);
+
 						offset++;
 						counter += 2;
 						if(is_full(counter)) {
@@ -427,7 +458,7 @@ int create_lvmexport(void)
 								p_range->blk_no = mdata_blocks;
 								p_range->next = NULL;
 							}
-							sync_to_lvm_image(exception_mdata, fd);
+							write_exception_mdata_to_disk(exception_mdata);
 							mdata_blocks++;
 						}
 					}
@@ -446,7 +477,7 @@ int create_lvmexport(void)
 		if(!p) {
 			if(verbose)			
 				fprintf(stderr, "\nFinal Sync...");
-			sync_to_lvm_image(exception_mdata, fd);
+			write_exception_mdata_to_disk(exception_mdata);
 		}
 		close(fd);
 	}
@@ -477,8 +508,14 @@ void dump_fiemap(struct fiemap *fiemap, int snapshot_file, int disk_image)
 			buf = (void *)malloc(fiemap->fm_extents[i].fe_length);
 			
 			lseek(snapshot_file, fiemap->fm_extents[i].fe_logical - SNAPSHOT_SHIFT, SEEK_SET);
-			read(snapshot_file, buf, fiemap->fm_extents[i].fe_length);			
+			read(snapshot_file, buf, fiemap->fm_extents[i].fe_length);
 
+			if(verbose)
+				printf("Lseek to : %ld (blocknumber : %ld) Length: %ld (%ld blocks)\n",
+				       fiemap->fm_extents[i].fe_logical - SNAPSHOT_SHIFT,
+				       (fiemap->fm_extents[i].fe_logical - SNAPSHOT_SHIFT)/SECTOR_SIZE,
+				       fiemap->fm_extents[i].fe_length,
+				       fiemap->fm_extents[i].fe_length/SECTOR_SIZE);
 			lseek(disk_image, fiemap->fm_extents[i].fe_logical - SNAPSHOT_SHIFT, SEEK_SET);
 			write(disk_image, buf, fiemap->fm_extents[i].fe_length);
 			free(buf);
@@ -562,17 +599,10 @@ void restore_fs(void)
 	do {
 		snapshot_name = node->name + strlen(snapshot_dir) + 1;
 
-#warning "Implement snapshot enable using ioctls"
-
 		if ((fd = open(node->name, O_RDONLY)) < 0) {
 			fprintf(stderr, "Cannot open file %s\n", node->name);
 			umount_device(device_path);
 			exit(EXIT_FAILURE);
-		}
-		else {
-			sprintf(command, "snapshot.ext4dev enable %s", snapshot_name);
-			fprintf(stderr, "\n%s\n",command);
-			system(command);
 		}
 			
 		if ((fiemap = read_fiemap(fd)) != NULL)
@@ -695,15 +725,11 @@ int parse_cmd_line(int argc, char *argv[])
                 exit(EXIT_FAILURE);
 	}
 	strcpy(mount_point, MNT);
-	if(mount(device_path, mount_point, "ext4dev", 0, NULL)) {
+	if(mount(device_path, mount_point, "ext4dev", MS_RDONLY, NULL)) {
 		fprintf(stderr, "Error while mounting, is device specified correctly?");
 		rmdir(mount_point);
                 exit(EXIT_FAILURE);
 	}
-
-#warning "Remove snapshot.ext4dev config command"
-	sprintf(command, "snapshot.ext4dev config %s %s",device_path,mount_point);
-	system(command);
 
 	return should_lvm_export;	
 }
@@ -741,14 +767,10 @@ int main(int argc, char **argv)
 	if(verbose)
 		fprintf(stderr, "\nTarget : %s \n",target_snapshot->name);
 
-	if(should_lvm_export) {
+	if(should_lvm_export)
 		create_lvmexport();
-	}
-	else {
+       	else
 		restore_fs();
-		sprintf(command, "fsck.ext4dev -fxp %s", argv[1]);
-		system(command);
-	}
 
         exit(EXIT_SUCCESS);
 }
