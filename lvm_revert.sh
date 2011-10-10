@@ -53,7 +53,7 @@ echo $?
 echo "#Warning : Fix size in lvcreate"
 sleep 1
 
-$EXT4DEV_RESTORE -i $SNAP -o /dev/mapper/$VG-$LVM_SNAP-cow -d /dev/$VG/$LV -l
+$EXT4DEV_RESTORE -i $SNAP -o /dev/mapper/$VG-$LVM_SNAP-cow -d /dev/mapper/$VG-$LV -l
 if [ $? -ne 0 ] ; then
     echo "ext4dev restore failed"
     lvremove -f $VG/$LVM_SNAP
